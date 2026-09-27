@@ -106,9 +106,10 @@ class ChessAgent(Agent):
             compaction_max_tokens=compaction_max_tokens,
         )
 
-        # TODO(Part 3): Register the play_move tool schema from tools.py.
+        self.tools.append(PLAY_MOVE_TOOL)
 
         if programmatic_tools:
+            self.tools.append(SIMULATE_MOVE_TOOL)
             self.tools.append(RUN_PYTHON_TOOL)
 
         # run_python always executes in the sandbox, on the port the chess
@@ -177,4 +178,67 @@ class ChessAgent(Agent):
 
         # TODO(Part 3.3-4): add cases for simulate_move and run_python, with
         # linked observations and recoverable errors, just like the old tool.
-        raise NotImplementedError
+        observations: list[dict[str, str]] = []
+        registered = {
+            tool.get("function", {}).get("name")
+            for tool in self.tools
+            if isinstance(tool, dict)
+        }
+        live_action_taken = False
+
+        for tool_call in tool_calls:
+            call_id = "unknown"
+            content: str
+            try:
+                if not isinstance(tool_call, dict):
+                    raise TypeError("Tool call must be an object.")
+                call_id = str(tool_call.get("id", "unknown"))
+                function = tool_call.get("function")
+                if not isinstance(function, dict):
+                    raise TypeError("Tool call is missing a function object.")
+                name = function.get("name")
+                arguments = function.get("arguments")
+                if not isinstance(name, str) or not isinstance(arguments, str):
+                    raise TypeError("Tool name and arguments must be strings.")
+                if name not in registered:
+                    raise ValueError(f"Tool is not registered: {name}")
+
+                if name in {"play_move", "run_python"} and live_action_taken:
+                    raise ValueError(
+                        "Only one live-game action may run from parallel tool calls."
+                    )
+
+                if name == "play_move":
+                    raw = _play_move(self.chess_client, arguments)
+                    if raw.startswith("<chess_error>"):
+                        content = raw
+                    else:
+                        state = json.loads(raw)
+                        self.last_state = state
+                        self.finished = bool(state.get("game_over"))
+                        content = self.format_state(state)
+                        live_action_taken = True
+                elif name == "simulate_move":
+                    content = _simulate_move(self.chess_client, arguments)
+                elif name == "run_python":
+                    content = _run_python(
+                        self.env, self.python_sandbox_port, arguments
+                    )
+                    if not content.startswith("<chess_error>"):
+                        state = _game_state(self.chess_client, reset=False)
+                        self.last_state = state
+                        self.finished = bool(state.get("game_over"))
+                        content = content + "\n" + self.format_state(state)
+                        live_action_taken = True
+                elif name == "invoke_skill":
+                    content = _invoke_skill(self.skills, arguments)
+                else:
+                    raise ValueError(f"Unknown tool: {name}")
+            except Exception as exc:
+                content = f"<chess_error>{exc}</chess_error>"
+
+            observations.append(
+                {"role": "tool", "tool_call_id": call_id, "content": content}
+            )
+
+        return observations

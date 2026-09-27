@@ -37,4 +37,9 @@ and terminal status. simulate_move does not change the state of the board but al
 the effects of taking an action on the board. Write Python code that uses simulate move to search
 for a good move to play at this state. You can write more complex search procedures with lookahead
 and complex logic to choose the move. Once you have chosen a move, write a call to play_move at
-the end of the Python code snippet to actually play that move."""
+the end of the Python code snippet to actually play that move.
+
+The search and commit must be one atomic run_python call: every search snippet must call
+play_move(best_move) exactly once as its final statement. Do not merely print the selected move
+and do not follow run_python with a separate direct play_move tool call. Keep the search to the
+two-ply procedure described by the loaded skill so it finishes within the sandbox timeout."""

@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+import yaml
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -30,7 +31,25 @@ MAX_OBSERVATION_CHARS = 10_000
 # TODO(Part 2): Write instructions that make the model produce concise working
 # memory for a software agent. The prompt should preserve concrete progress,
 # failures, test results, constraints, and next steps without copying raw output.
-COMPACTION_SYSTEM_PROMPT = ""
+COMPACTION_SYSTEM_PROMPT = """
+You are creating concise factual working memory for a software agent.
+
+Summarize only the supplied older interaction history. Preserve the information
+needed to continue the task correctly:
+
+- the original objective and important constraints;
+- files inspected and relevant code locations;
+- commands already run and their concrete results;
+- edits already made;
+- test names and exact pass/fail results;
+- failed approaches and why they failed;
+- current blockers or unresolved questions;
+- the most useful next action.
+
+Do not invent facts. Do not copy long raw command output when a concise factual
+description is sufficient. Preserve exact paths, identifiers, error messages,
+and numeric results when they matter. Write only the working-memory summary.
+""".strip()
 
 
 class StepLimitError(Exception):
@@ -152,6 +171,7 @@ class Agent:
 
         # TODO(1.1.a): Add machinery to maintain agent state as it takes actions
         # and observes the results.
+        self.history: list[dict[str, Any]] = []
 
     def load_skills(self, skills_path: Path) -> dict[str, dict[str, str]]:
         """Load the skill folders exposed to this agent."""
@@ -164,7 +184,81 @@ class Agent:
         # ``content`` of the skill file for ``invoke_skill``. Reject duplicate
         # names and malformed or missing frontmatter with a clear
         # ``ValueError``.
-        raise NotImplementedError
+        if not skills_path.exists():
+            raise ValueError(f"Skills path does not exist: {skills_path}")
+
+        if not skills_path.is_dir():
+            raise ValueError(f"Skills path is not a directory: {skills_path}")
+
+        skills: dict[str, dict[str, str]] = {}
+
+        for skill_directory in sorted(skills_path.iterdir()):
+            if not skill_directory.is_dir():
+                continue
+
+            skill_file = skill_directory / "SKILL.md"
+            if not skill_file.is_file():
+                raise ValueError(
+                    f"Skill directory does not contain SKILL.md: {skill_directory}"
+                )
+
+            content = skill_file.read_text(encoding="utf-8")
+            lines = content.splitlines()
+
+            if not lines or lines[0].strip() != "---":
+                raise ValueError(
+                    f"Skill file is missing opening YAML frontmatter: {skill_file}"
+                )
+
+            closing_index = next(
+                (
+                    index
+                    for index, line in enumerate(lines[1:], start=1)
+                    if line.strip() == "---"
+                ),
+                None,
+            )
+            if closing_index is None:
+                raise ValueError(
+                    f"Skill file is missing closing YAML frontmatter: {skill_file}"
+                )
+
+            frontmatter_text = "\n".join(lines[1:closing_index])
+            try:
+                frontmatter = yaml.safe_load(frontmatter_text)
+            except yaml.YAMLError as exc:
+                raise ValueError(
+                    f"Skill file has invalid YAML frontmatter: {skill_file}"
+                ) from exc
+
+            if not isinstance(frontmatter, dict):
+                raise ValueError(
+                    f"Skill frontmatter must be a mapping: {skill_file}"
+                )
+
+            name = frontmatter.get("name")
+            description = frontmatter.get("description")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(
+                    f"Skill frontmatter has a missing or invalid name: {skill_file}"
+                )
+            if not isinstance(description, str) or not description.strip():
+                raise ValueError(
+                    "Skill frontmatter has a missing or invalid description: "
+                    f"{skill_file}"
+                )
+
+            name = name.strip()
+            description = description.strip()
+            if name in skills:
+                raise ValueError(f"Duplicate skill name: {name}")
+
+            skills[name] = {
+                "metadata": f"name: {name}\ndescription: {description}",
+                "content": content,
+            }
+
+        return skills
 
     def query_language_model(self) -> dict[str, Any]:
         """Send one tool-enabled Chat Completions request and normalize it."""
@@ -227,7 +321,18 @@ class Agent:
 
         # You want to be careful about which attributes of the class you modify
         # here as they may also be handled by the subclasses.
-        raise NotImplementedError
+        prompt = [
+            {
+                "role": "system",
+                "content": self.system_prompt,
+            },
+            {
+                "role": "user",
+                "content": self.task_prompt,
+            },
+        ]
+        prompt.extend(deepcopy(self.history))
+        return prompt
 
     def estimate_active_prompt_tokens(self) -> int:
         """Estimate the next prompt, calibrated by the provider's latest usage."""
@@ -265,9 +370,44 @@ class Agent:
         # with all linked tool observations. The resulting summary should change
         # what `build_prompt` emits, and reduce the length of the prompt.
 
-        raise NotImplementedError
+        assistant_indices = [
+            index
+            for index, message in enumerate(self.history)
+            if message.get("role") == "assistant"
+        ]
+        if len(assistant_indices) <= self.compaction_keep_recent_steps:
+            raise RuntimeError("Not enough history to compact.")
 
-        compaction_prompt = []
+        keep_start = assistant_indices[-self.compaction_keep_recent_steps]
+        old_history = deepcopy(self.history[:keep_start])
+        recent_history = deepcopy(self.history[keep_start:])
+
+        compaction_source = [
+            {
+                "role": "system",
+                "content": self.system_prompt,
+            },
+            {
+                "role": "user",
+                "content": self.task_prompt,
+            },
+            *old_history,
+        ]
+
+        compaction_prompt = [
+            {
+                "role": "system",
+                "content": COMPACTION_SYSTEM_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Create working memory from the following original "
+                    "instructions and older interaction history:\n\n"
+                    f"{json.dumps(compaction_source, ensure_ascii=False, indent=2)}"
+                ),
+            },
+        ]
 
         ### Do not modify this section ###
         compaction_response = self.client.chat.completions.create(
@@ -280,6 +420,22 @@ class Agent:
 
         # Use `compaction_response` to update what `build_prompt` emits, but
         # DO NOT modify the object itself. Let the method return it unchanged.
+
+        summary = compaction_response.choices[0].message.content
+        if not isinstance(summary, str) or not summary.strip():
+            raise RuntimeError("Context compaction returned an empty summary.")
+
+        self.history = [
+            {
+                "role": "user",
+                "content": (
+                    "<working_memory>\n"
+                    f"{summary.strip()}\n"
+                    "</working_memory>"
+                ),
+            },
+            *recent_history,
+        ]
 
         ### Do not modify this section ###
         return compaction_prompt, compaction_response.model_dump(mode="json")
@@ -336,7 +492,24 @@ class Agent:
             # and handles the threshold, and tracks compaction events for
             # logging.
 
-            raise NotImplementedError
+            while not self.finished:
+                if self.steps_taken >= self.step_limit:
+                    raise StepLimitError(
+                        f"Agent exceeded step limit of {self.step_limit}"
+                    )
+                self.maybe_compact_context()
+
+                assistant_message = self.query_language_model()
+                self.history.append(deepcopy(assistant_message))
+
+                tool_calls = assistant_message.get("tool_calls", [])
+                if not tool_calls:
+                    continue
+                observations = self.execute_tool_calls(tool_calls)
+                self.history.extend(deepcopy(observations))
+                # TODO(1.1.a): Update the agent's state with the new observations
+                # and reasoning from this step, so that `build_prompt` will
+                # include them in the next prompt.
         finally:
             # This block is provided infrastructure. Do not modify it: a
             # trajectory is required even when a run fails.

@@ -9,4 +9,25 @@ __pycache__/
 data/*
 !data/README.md
 !data/.gitkeep
+
+# Keep generated scratch runs out of Git. Only assignment deliverables are
+# explicitly allowed below.
+artifacts/*
+!artifacts/fix.patch
+!artifacts/part1-trajectory.json
+!artifacts/django__django-15368.patch
+!artifacts/django__django-15368-trajectory.json
+!artifacts/token-usage-analysis.md
+!artifacts/part3-trajectory.json
+!artifacts/game-result.json
+!artifacts/part3-no-legal-moves-deepseek.json
+!artifacts/part3-no-legal-moves-deepseek-result.json
+!artifacts/part3-legal-moves-deepseek.json
+!artifacts/part3-legal-moves-deepseek-result.json
+!artifacts/part3-no-legal-moves-gpt-oss.json
+!artifacts/part3-no-legal-moves-gpt-oss-result.json
+!artifacts/part3-legal-moves-gpt-oss.json
+!artifacts/part3-legal-moves-gpt-oss-result.json
+!artifacts/observation-experiment.md
+!artifacts/part3-python-skill-trajectory.json
 .env
